@@ -236,6 +236,66 @@ def draw_ui(frame, color_idx, eraser_mode, fist_count, gesture, selected_stroke)
 
     cv2.putText(frame, "Ctrl+Z: Undo  |  Ctrl+S: Save PNG  |  Q/ESC: Quit",
                 (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)
+    
+def apply_eraser(strokes, eraser_stroke):
+    """
+    Remove only the points of each stroke that fall within the eraser radius.
+    Strokes get split into surviving segments — each continuous run of
+    remaining points becomes its own stroke.
+    """
+    if not eraser_stroke.points:
+        return strokes
+
+    radius = eraser_stroke.thickness // 2
+    result = []
+
+    for stroke in strokes:
+        if stroke.is_eraser:
+            continue
+
+        # Mark which points survive (not hit by any eraser point)
+        surviving_pts = []
+        for sp in stroke.points:
+            hit = any(
+                np.hypot(ep[0] - sp[0], ep[1] - sp[1]) < radius
+                for ep in eraser_stroke.points
+            )
+            if not hit:
+                surviving_pts.append(sp)
+
+        # Split surviving points into continuous segments
+        # (gaps where erased points were become breaks between strokes)
+        if not surviving_pts:
+            continue  # entire stroke erased
+
+        original_indices = [
+            i for i, sp in enumerate(stroke.points)
+            if sp in surviving_pts
+        ]
+
+        segment_pts = []
+        for k, idx in enumerate(original_indices):
+            if k == 0:
+                segment_pts.append(stroke.points[idx])
+            else:
+                prev_idx = original_indices[k - 1]
+                if idx - prev_idx == 1:
+                    # Consecutive — same segment
+                    segment_pts.append(stroke.points[idx])
+                else:
+                    # Gap — save current segment, start new one
+                    if segment_pts:
+                        new_stroke = Stroke(stroke.color, stroke.thickness)
+                        new_stroke.points = segment_pts
+                        result.append(new_stroke)
+                    segment_pts = [stroke.points[idx]]
+
+        if segment_pts:
+            new_stroke = Stroke(stroke.color, stroke.thickness)
+            new_stroke.points = segment_pts
+            result.append(new_stroke)
+
+    return result
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
@@ -293,7 +353,11 @@ def main():
 
                 # Finalize any in-progress stroke if gesture left draw/erase
                 if gesture not in ("DRAW", "ERASER") and current_stroke:
-                    current_stroke = finalize_stroke(strokes, current_stroke)
+                    if current_stroke.is_eraser:
+                        strokes = apply_eraser(strokes, current_stroke)
+                        current_stroke = None
+                    else:
+                        current_stroke = finalize_stroke(strokes, current_stroke)
 
                 # Deselect stroke if gesture left pinch
                 if gesture != "PINCH":
@@ -392,7 +456,11 @@ def main():
 
             else:
                 # No hand in frame — finalize anything in progress
-                current_stroke  = finalize_stroke(strokes, current_stroke)
+                if current_stroke and current_stroke.is_eraser:
+                    strokes = apply_eraser(strokes, current_stroke)
+                    current_stroke = None
+                else:
+                    current_stroke = finalize_stroke(strokes, current_stroke)
                 fist_count      = 0
                 pinch_prev      = None
                 selected_stroke = None
