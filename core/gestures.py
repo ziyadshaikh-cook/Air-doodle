@@ -2,10 +2,9 @@ import numpy as np
 from core.stroke import Stroke
 
 # ─── Gesture constants ─────────────────────────────────────────────────────────
-PINCH_THRESHOLD  = 40    # pixel distance thumb↔index to count as pinch
-NEUTRAL_SPREAD   = 55    # px between index+middle tips to enter neutral mode
-SELECT_RADIUS    = 70    # px padding around stroke bounding box for pinch selection
-ROTATE_DEAD_ZONE = 0.03  # radians — ignore tiny angle changes to reduce jitter
+PINCH_THRESHOLD = 40    # pixel distance thumb↔index to count as pinch
+NEUTRAL_SPREAD  = 55    # px between index+middle tips to enter neutral mode
+SELECT_RADIUS   = 70    # px padding around stroke bounding box for pinch selection
 
 
 def lm_px(lm, w, h):
@@ -58,45 +57,6 @@ def detect_gesture(lms, w, h):
         return "DRAW", None
     else:
         return "IDLE", None
-
-
-def detect_rotate_gesture(lms, w, h):
-    """
-    Detects the ROTATE gesture on a hand:
-      index + thumb + middle all up, ring + pinky down.
-
-    Returns (True, rotation_reference_point) or (False, None).
-    The rotation_reference_point is the centroid of the three fingertips.
-    The caller computes angle from two consecutive frames to get delta_angle.
-    """
-    idx_up  = finger_up(lms, 8,  6)
-    mid_up  = finger_up(lms, 12, 10)
-    ring_up = finger_up(lms, 16, 14)
-    pky_up  = finger_up(lms, 20, 18)
-
-    # Thumb: use y-distance from wrist as a rough "up" check
-    # lms[4] = thumb tip, lms[2] = thumb MCP
-    thumb_up = lms[4].y < lms[2].y
-
-    if idx_up and mid_up and thumb_up and not ring_up and not pky_up:
-        tx, ty = lm_px(lms[4],  w, h)   # thumb tip
-        ix, iy = lm_px(lms[8],  w, h)   # index tip
-        mx, my = lm_px(lms[12], w, h)   # middle tip
-        # Also make sure this is NOT a pinch (thumb & index not too close)
-        pinch_dist = np.hypot(tx - ix, ty - iy)
-        if pinch_dist < 40:
-            # Too close — would collide with PINCH; ignore
-            return False, None
-        cx = (tx + ix + mx) // 3
-        cy = (ty + iy + my) // 3
-        return True, (cx, cy)
-
-    return False, None
-
-
-def angle_of_point(pt, origin):
-    """Returns angle in radians from origin to pt."""
-    return np.arctan2(pt[1] - origin[1], pt[0] - origin[0])
 
 
 def find_stroke_at(strokes, px, py):

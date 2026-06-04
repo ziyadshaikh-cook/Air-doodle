@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import math
 
 
 class Stroke:
@@ -9,7 +8,6 @@ class Stroke:
         self.color     = color
         self.thickness = thickness
         self.is_eraser = is_eraser
-        self._angle    = 0.0          # cumulative rotation in radians
 
     def add_point(self, pt):
         self.points.append(pt)
@@ -23,24 +21,6 @@ class Stroke:
 
     def translate(self, dx, dy):
         self.points = [(p[0] + dx, p[1] + dy) for p in self.points]
-
-    def rotate(self, delta_angle):
-        """Rotate all points by delta_angle (radians) around their centroid."""
-        if not self.points:
-            return
-        self._angle += delta_angle
-        cx = sum(p[0] for p in self.points) / len(self.points)
-        cy = sum(p[1] for p in self.points) / len(self.points)
-        cos_a = math.cos(delta_angle)
-        sin_a = math.sin(delta_angle)
-        new_pts = []
-        for px, py in self.points:
-            rx = px - cx
-            ry = py - cy
-            nx = cx + rx * cos_a - ry * sin_a
-            ny = cy + rx * sin_a + ry * cos_a
-            new_pts.append((int(nx), int(ny)))
-        self.points = new_pts
 
     def draw_on(self, canvas):
         if not self.points:

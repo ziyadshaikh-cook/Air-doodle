@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-# ─── Palette constants ─────────────────────────────────────────────────────────────────────────
+# ─── Palette constants ─────────────────────────────────────────────────────────
 PALETTE = [
     ("Red",    (0,   0,   255)),
     ("Orange", (0,   140, 255)),
@@ -49,11 +49,10 @@ def render_canvas(strokes, current_stroke, h, w):
     return canvas
 
 
-def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames,
-            gesture, selected_stroke, rotate_stroke=None, rotate_angle=None):
+def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames, gesture, selected_stroke):
     h, w = frame.shape[:2]
 
-    # ── Colour palette ──────────────────────────────────────────────────────────────────────────────
+    # ── Colour palette ────────────────────────────────────────────────────────
     for i, (_, bgr) in enumerate(PALETTE):
         cx = PAL_X0 + i * PAL_STEP
         cv2.circle(frame, (cx, PAL_Y), PAL_R, bgr, -1)
@@ -61,47 +60,33 @@ def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames,
         if i == color_idx and not eraser_mode:
             cv2.circle(frame, (cx, PAL_Y), PAL_R + 5, (255, 255, 255), 2)
 
-    # ── Mode label ──────────────────────────────────────────────────────────────────────────────
+    # ── Mode label ────────────────────────────────────────────────────────────
     labels = {
-        "ERASER":  ("[ ERASER ]",             (60,  60,  255)),
-        "NEUTRAL": ("[ HOVER — safe ]",        (200, 200,   0)),
-        "PINCH":   ("[ MOVING ]",              (0,   200, 255)),
-        "FIST":    ("[ FIST — hold clear ]",   (0,   100, 255)),
-        "DRAW":    ("[ DRAW ]",                (60,  220,  60)),
-        "ROTATE":  ("[ ROTATING ]",            (255, 165,   0)),
-        "IDLE":    ("[ IDLE ]",                (120, 120, 120)),
+        "ERASER":  ("[ ERASER ]",           (60,  60,  255)),
+        "NEUTRAL": ("[ HOVER — safe ]",      (200, 200,   0)),
+        "PINCH":   ("[ MOVING ]",            (0,   200, 255)),
+        "FIST":    ("[ FIST — hold clear ]", (0,   100, 255)),
+        "DRAW":    ("[ DRAW ]",              (60,  220,  60)),
+        "IDLE":    ("[ IDLE ]",              (120, 120, 120)),
     }
     lbl_key   = "ERASER" if eraser_mode else gesture
     text, col = labels.get(lbl_key, ("", (255, 255, 255)))
-    cv2.putText(frame, text, (w - 290, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
+    cv2.putText(frame, text, (w - 270, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
 
-    # ── Selected / rotating stroke highlight ──────────────────────────────────────────────
-    for s, label_text, box_color in [
-        (selected_stroke, "moving",   (0,   220, 255)),
-        (rotate_stroke,   "rotating", (255, 165,   0)),
-    ]:
-        if s:
-            b = s.bounds()
-            if b:
-                x1, y1, x2, y2 = b
-                pad = 12
-                cv2.rectangle(frame,
-                              (x1 - pad, y1 - pad),
-                              (x2 + pad, y2 + pad),
-                              box_color, 2)
-                # Show rotation angle if available
-                if label_text == "rotating" and rotate_angle is not None:
-                    import math
-                    deg = int(math.degrees(rotate_angle) % 360)
-                    cv2.putText(frame, f"{label_text} {deg}°",
-                                (x1 - pad, y1 - pad - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1)
-                else:
-                    cv2.putText(frame, label_text,
-                                (x1 - pad, y1 - pad - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1)
+    # ── Selected stroke highlight ─────────────────────────────────────────────
+    if selected_stroke:
+        b = selected_stroke.bounds()
+        if b:
+            x1, y1, x2, y2 = b
+            pad = 12
+            cv2.rectangle(frame,
+                          (x1 - pad, y1 - pad),
+                          (x2 + pad, y2 + pad),
+                          (0, 220, 255), 2)
+            cv2.putText(frame, "moving", (x1 - pad, y1 - pad - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
 
-    # ── Fist clear progress bar ─────────────────────────────────────────────────────────────────────
+    # ── Fist clear progress bar ───────────────────────────────────────────────
     if fist_count > 0:
         bx, by = w // 2 - 110, h - 40
         bw     = int((fist_count / fist_clear_frames) * 220)
@@ -111,16 +96,18 @@ def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames,
         cv2.putText(frame, "HOLD FIST TO CLEAR", (bx + 28, by - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
-    # ── Gesture guide ───────────────────────────────────────────────────────────────────────────────
+    # ── Gesture guide ─────────────────────────────────────────────────────────
     guide = [
-        "1 finger       : draw",
-        "2 close        : erase",
-        "2 spread       : hover",
-        "pinch          : move stroke",
-        "3 fingers+thumb: rotate stroke",
-        "fist 1sec      : clear all",
+        "1 finger  : draw",
+        "2 close   : erase",
+        "2 spread  : hover",
+        "pinch     : move stroke",
+        "fist 1sec : clear all",
     ]
     for j, line in enumerate(guide):
-        cv2.putText(frame, line,
-                    (w - 310, h - 155 + j * 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
+        cv2.putText(frame, line, (w - 185, 65 + j * 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.37, (140, 140, 140), 1)
+
+    # ── Controls hint ─────────────────────────────────────────────────────────
+    cv2.putText(frame, "Ctrl+Z: Undo  |  Ctrl+S: Save PNG  |  Q/ESC: Quit",
+                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)

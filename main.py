@@ -4,16 +4,12 @@ import numpy as np
 from collections import deque
 from datetime import datetime
 import copy
-import math
 
 from core.stroke import Stroke, finalize_stroke
-from core.gestures import (
-    detect_gesture, detect_rotate_gesture, find_stroke_at,
-    apply_eraser, lm_px, angle_of_point, ROTATE_DEAD_ZONE
-)
+from core.gestures import detect_gesture, find_stroke_at, apply_eraser, lm_px
 from core.ui import PALETTE, hit_palette, blend_canvas, render_canvas, draw_ui
 
-# ─── Configuration ──────────────────────────────────────────────────────────────────────────────
+# ─── Configuration ─────────────────────────────────────────────────────────────
 BRUSH_THICKNESS   = 6
 ERASER_THICKNESS  = 50
 FIST_CLEAR_FRAMES = 30
@@ -62,11 +58,6 @@ def main():
     selected_stroke = None
     smooth_buf      = deque(maxlen=SMOOTH_BUFFER)
 
-    # ─ Rotation state ───────────────────────────────────────────────────────────────────────
-    rotate_stroke      = None   # stroke currently being rotated
-    rotate_ref_angle   = None   # angle (radians) of the rotate-gesture centroid from wrist, previous frame
-    rotate_total_angle = 0.0    # total rotation applied this session (for display)
-
     with mp_hands.Hands(
             max_num_hands=1,
             min_detection_confidence=0.7,
@@ -89,151 +80,106 @@ def main():
                 lms = hand_lms.landmark
 
             if lms:
-                # ── Check rotate gesture BEFORE the main gesture detector ────────────────────
-                is_rotate, rot_center = detect_rotate_gesture(lms, w, h)
+                gesture, pinch_pt = detect_gesture(lms, w, h)
 
-                if is_rotate:
-                    gesture = "ROTATE"
+                raw_ix, raw_iy = lm_px(lms[8], w, h)
+                ix, iy         = smooth_point(smooth_buf, (raw_ix, raw_iy))
 
-                    # Use wrist (lms[0]) as the pivot origin for angle tracking
-                    wx, wy = lm_px(lms[0], w, h)
-                    cur_angle = angle_of_point(rot_center, (wx, wy))
+                # Finalize in-progress stroke if gesture left draw/erase
+                if gesture not in ("DRAW", "ERASER") and current_stroke:
+                    if current_stroke.is_eraser:
+                        strokes        = apply_eraser(strokes, current_stroke)
+                        current_stroke = None
+                    else:
+                        current_stroke = finalize_stroke(strokes, current_stroke)
 
-                    if rotate_stroke is None:
-                        # First frame of rotate gesture: find which stroke to rotate
-                        candidate = find_stroke_at(strokes, rot_center[0], rot_center[1])
+                # Deselect stroke if gesture left pinch
+                if gesture != "PINCH":
+                    selected_stroke = None
+                    pinch_prev      = None
+
+                # ── FIST: hold to clear all strokes ──────────────────────
+                if gesture == "FIST":
+                    fist_count += 1
+                    if fist_count >= FIST_CLEAR_FRAMES:
+                        push_undo(undo_stack, strokes)
+                        strokes    = []
+                        fist_count = 0
+                        print("[Cleared]")
+
+                # ── PINCH: find and move individual stroke ────────────────
+                elif gesture == "PINCH":
+                    fist_count = 0
+
+                    if selected_stroke is None:
+                        candidate = find_stroke_at(strokes, pinch_pt[0], pinch_pt[1])
                         if candidate:
                             push_undo(undo_stack, strokes)
-                            rotate_stroke      = candidate
-                            rotate_total_angle = rotate_stroke._angle
-                        rotate_ref_angle = cur_angle
-
+                            selected_stroke = candidate
+                            pinch_prev      = pinch_pt
                     else:
-                        if rotate_ref_angle is not None:
-                            delta = cur_angle - rotate_ref_angle
-                            # Wrap delta into [−pi, +pi] to handle crossing ±180°
-                            if delta >  math.pi:
-                                delta -= 2 * math.pi
-                            if delta < -math.pi:
-                                delta += 2 * math.pi
+                        if pinch_prev is not None:
+                            dx = pinch_pt[0] - pinch_prev[0]
+                            dy = pinch_pt[1] - pinch_prev[1]
+                            if abs(dx) > PINCH_DEAD_ZONE or abs(dy) > PINCH_DEAD_ZONE:
+                                selected_stroke.translate(dx, dy)
+                        pinch_prev = pinch_pt
 
-                            if abs(delta) > ROTATE_DEAD_ZONE:
-                                rotate_stroke.rotate(delta)
-                                rotate_total_angle += delta
+                    cv2.circle(frame, pinch_pt, 12, (255, 200, 0), 2)
 
-                        rotate_ref_angle = cur_angle
+                # ── NEUTRAL: safe hover, nothing happens ──────────────────
+                elif gesture == "NEUTRAL":
+                    fist_count  = 0
+                    eraser_mode = False
 
-                    # Visual feedback: draw arc around the rotate gesture centroid
-                    cv2.circle(frame, rot_center, 18, (255, 165, 0), 2)
-                    cv2.putText(frame, f"{int(math.degrees(rotate_total_angle) % 360)}°",
-                                (rot_center[0] + 22, rot_center[1] + 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 165, 0), 2)
+                # ── ERASER: drag two fingers to erase like a duster ───────
+                elif gesture == "ERASER":
+                    fist_count  = 0
+                    eraser_mode = True
 
-                else:
-                    # Reset rotation state when gesture is released
-                    rotate_stroke    = None
-                    rotate_ref_angle = None
+                    mx, my = lm_px(lms[12], w, h)
+                    ex     = (ix + mx) // 2
+                    ey     = (iy + my) // 2
 
-                    gesture, pinch_pt = detect_gesture(lms, w, h)
+                    cv2.circle(frame, (ex, ey), ERASER_THICKNESS // 2, (80, 80, 255), 2)
 
-                    raw_ix, raw_iy = lm_px(lms[8], w, h)
-                    ix, iy         = smooth_point(smooth_buf, (raw_ix, raw_iy))
+                    if current_stroke is None:
+                        push_undo(undo_stack, strokes)
+                        current_stroke = Stroke((0, 0, 0), ERASER_THICKNESS, is_eraser=True)
+                        current_stroke.add_point((ex, ey))
+                    else:
+                        last = current_stroke.points[-1]
+                        if np.hypot(ex - last[0], ey - last[1]) > MIN_DRAW_DIST:
+                            current_stroke.add_point((ex, ey))
 
-                    # Finalize in-progress stroke if gesture left draw/erase
-                    if gesture not in ("DRAW", "ERASER") and current_stroke:
-                        if current_stroke.is_eraser:
-                            strokes        = apply_eraser(strokes, current_stroke)
-                            current_stroke = None
-                        else:
-                            current_stroke = finalize_stroke(strokes, current_stroke)
+                # ── DRAW ──────────────────────────────────────────────────
+                elif gesture == "DRAW":
+                    fist_count  = 0
+                    eraser_mode = False
 
-                    # Deselect stroke if gesture left pinch
-                    if gesture != "PINCH":
-                        selected_stroke = None
-                        pinch_prev      = None
-
-                    # ── FIST: hold to clear all strokes ───────────────────────────────────────
-                    if gesture == "FIST":
-                        fist_count += 1
-                        if fist_count >= FIST_CLEAR_FRAMES:
-                            push_undo(undo_stack, strokes)
-                            strokes    = []
-                            fist_count = 0
-                            print("[Cleared]")
-
-                    # ── PINCH: find and move individual stroke ────────────────────────────────
-                    elif gesture == "PINCH":
-                        fist_count = 0
-
-                        if selected_stroke is None:
-                            candidate = find_stroke_at(strokes, pinch_pt[0], pinch_pt[1])
-                            if candidate:
-                                push_undo(undo_stack, strokes)
-                                selected_stroke = candidate
-                                pinch_prev      = pinch_pt
-                        else:
-                            if pinch_prev is not None:
-                                dx = pinch_pt[0] - pinch_prev[0]
-                                dy = pinch_pt[1] - pinch_prev[1]
-                                if abs(dx) > PINCH_DEAD_ZONE or abs(dy) > PINCH_DEAD_ZONE:
-                                    selected_stroke.translate(dx, dy)
-                            pinch_prev = pinch_pt
-
-                        cv2.circle(frame, pinch_pt, 12, (255, 200, 0), 2)
-
-                    # ── NEUTRAL: safe hover, nothing happens ────────────────────────────────
-                    elif gesture == "NEUTRAL":
-                        fist_count  = 0
-                        eraser_mode = False
-
-                    # ── ERASER: drag two fingers to erase like a duster ─────────────────────
-                    elif gesture == "ERASER":
-                        fist_count  = 0
-                        eraser_mode = True
-
-                        mx, my = lm_px(lms[12], w, h)
-                        ex     = (ix + mx) // 2
-                        ey     = (iy + my) // 2
-
-                        cv2.circle(frame, (ex, ey), ERASER_THICKNESS // 2, (80, 80, 255), 2)
+                    hit = hit_palette(ix, iy)
+                    if hit >= 0:
+                        color_idx      = hit
+                        current_stroke = finalize_stroke(strokes, current_stroke)
+                    else:
+                        color = PALETTE[color_idx][1]
+                        cv2.circle(frame, (ix, iy), BRUSH_THICKNESS // 2 + 2, color, -1)
 
                         if current_stroke is None:
                             push_undo(undo_stack, strokes)
-                            current_stroke = Stroke((0, 0, 0), ERASER_THICKNESS, is_eraser=True)
-                            current_stroke.add_point((ex, ey))
+                            current_stroke = Stroke(color, BRUSH_THICKNESS)
+                            current_stroke.add_point((ix, iy))
                         else:
                             last = current_stroke.points[-1]
-                            if np.hypot(ex - last[0], ey - last[1]) > MIN_DRAW_DIST:
-                                current_stroke.add_point((ex, ey))
-
-                    # ── DRAW ───────────────────────────────────────────────────────────────────────────────
-                    elif gesture == "DRAW":
-                        fist_count  = 0
-                        eraser_mode = False
-
-                        hit = hit_palette(ix, iy)
-                        if hit >= 0:
-                            color_idx      = hit
-                            current_stroke = finalize_stroke(strokes, current_stroke)
-                        else:
-                            color = PALETTE[color_idx][1]
-                            cv2.circle(frame, (ix, iy), BRUSH_THICKNESS // 2 + 2, color, -1)
-
-                            if current_stroke is None:
-                                push_undo(undo_stack, strokes)
-                                current_stroke = Stroke(color, BRUSH_THICKNESS)
+                            dist = np.hypot(ix - last[0], iy - last[1])
+                            if MIN_DRAW_DIST < dist < MAX_DRAW_DIST:
                                 current_stroke.add_point((ix, iy))
-                            else:
-                                last = current_stroke.points[-1]
-                                dist = np.hypot(ix - last[0], iy - last[1])
-                                if MIN_DRAW_DIST < dist < MAX_DRAW_DIST:
-                                    current_stroke.add_point((ix, iy))
-                                elif dist >= MAX_DRAW_DIST:
-                                    current_stroke.add_point((ix, iy))
+                            elif dist >= MAX_DRAW_DIST:
+                                current_stroke.add_point((ix, iy))
 
-                    # ── IDLE ──────────────────────────────────────────────────────────────────────────────
-                    else:
-                        fist_count = 0
+                # ── IDLE ──────────────────────────────────────────────────
+                else:
+                    fist_count = 0
 
             else:
                 # No hand in frame — finalize anything in progress
@@ -246,20 +192,16 @@ def main():
                 fist_count      = 0
                 pinch_prev      = None
                 selected_stroke = None
-                rotate_stroke   = None
-                rotate_ref_angle = None
                 smooth_buf.clear()
 
-            # ── Render ───────────────────────────────────────────────────────────────────────────────
+            # ── Render ────────────────────────────────────────────────────
             canvas = render_canvas(strokes, current_stroke, h, w)
             output = blend_canvas(frame, canvas)
             draw_ui(output, color_idx, eraser_mode,
-                    fist_count, FIST_CLEAR_FRAMES, gesture, selected_stroke,
-                    rotate_stroke=rotate_stroke,
-                    rotate_angle=rotate_total_angle if rotate_stroke else None)
+                    fist_count, FIST_CLEAR_FRAMES, gesture, selected_stroke)
             cv2.imshow("Air Doodle", output)
 
-            # ── Keyboard ──────────────────────────────────────────────────────────────────────────────
+            # ── Keyboard ──────────────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord('q'), 27):
@@ -270,7 +212,6 @@ def main():
                     strokes         = undo_stack.pop()
                     current_stroke  = None
                     selected_stroke = None
-                    rotate_stroke   = None
                     print(f"[Undo] {len(undo_stack)} states left")
 
             elif key == 19:                  # Ctrl+S
