@@ -1,10 +1,12 @@
 import numpy as np
+import math
 from core.stroke import Stroke
 
 # ─── Gesture constants ─────────────────────────────────────────────────────────
-PINCH_THRESHOLD = 40    # pixel distance thumb↔index to count as pinch
-NEUTRAL_SPREAD  = 55    # px between index+middle tips to enter neutral mode
-SELECT_RADIUS   = 70    # px padding around stroke bounding box for pinch selection
+PINCH_THRESHOLD  = 40     # pixel distance thumb↔index to count as pinch
+NEUTRAL_SPREAD   = 55     # px between index+middle tips to enter neutral mode
+SELECT_RADIUS    = 70     # px padding around stroke bounding box for selection
+ROTATE_DEAD_ZONE = 0.025  # radians (~1.4°) — filters out hand tremor
 
 
 def lm_px(lm, w, h):
@@ -24,7 +26,6 @@ def detect_gesture(lms, w, h):
       ERASER  — index + middle up, close together → duster erase
       DRAW    — only index up → draw
       IDLE    — everything else
-
     Returns (gesture_str, pinch_center_or_None)
     """
     idx_up  = finger_up(lms, 8,  6)
@@ -59,6 +60,18 @@ def detect_gesture(lms, w, h):
         return "IDLE", None
 
 
+def get_wrist_angle(lms, w, h):
+    """
+    Returns the angle (radians) of the wrist orientation vector.
+    Uses wrist (lm[0]) → middle finger MCP (lm[9]).
+    Physically rotating this hand (wrist twist) changes this angle,
+    which maps directly to rotating the selected stroke.
+    """
+    wx, wy = lm_px(lms[0], w, h)
+    mx, my = lm_px(lms[9], w, h)
+    return math.atan2(my - wy, mx - wx)
+
+
 def find_stroke_at(strokes, px, py):
     """
     Returns the topmost non-eraser stroke whose bounding box
@@ -81,9 +94,8 @@ def find_stroke_at(strokes, px, py):
 def apply_eraser(strokes, eraser_stroke):
     """
     Remove only the points of each stroke that fall within the eraser radius.
-    Strokes get split into surviving segments — each continuous run of
-    remaining points becomes its own stroke object.
-    Eraser strokes are never stored permanently.
+    Uses index-based masking (not value equality) so float coords work correctly.
+    Strokes get split into surviving segments — never stored permanently.
     """
     if not eraser_stroke.points:
         return strokes
@@ -95,26 +107,22 @@ def apply_eraser(strokes, eraser_stroke):
         if stroke.is_eraser:
             continue
 
-        # Mark which points survive (not hit by any eraser point)
-        surviving_pts = []
+        # Build a boolean mask: True = point survives
+        surviving_mask = []
         for sp in stroke.points:
             hit = any(
                 np.hypot(ep[0] - sp[0], ep[1] - sp[1]) < radius
                 for ep in eraser_stroke.points
             )
-            if not hit:
-                surviving_pts.append(sp)
+            surviving_mask.append(not hit)
 
-        if not surviving_pts:
-            continue  # entire stroke erased, drop it
+        if not any(surviving_mask):
+            continue  # entire stroke erased
 
-        # Map surviving points back to original indices
-        original_indices = [
-            i for i, sp in enumerate(stroke.points)
-            if sp in surviving_pts
-        ]
+        # Get original indices of surviving points
+        original_indices = [i for i, keep in enumerate(surviving_mask) if keep]
 
-        # Split into continuous segments (gaps = where erasure happened)
+        # Split into continuous segments (gaps = erased sections)
         segment_pts = []
         for k, idx in enumerate(original_indices):
             if k == 0:
@@ -124,16 +132,15 @@ def apply_eraser(strokes, eraser_stroke):
                 if idx - prev_idx == 1:
                     segment_pts.append(stroke.points[idx])
                 else:
-                    # Gap found — save current segment, start new one
                     if segment_pts:
                         new_stroke = Stroke(stroke.color, stroke.thickness)
-                        new_stroke.points = segment_pts
+                        new_stroke.points = list(segment_pts)
                         result.append(new_stroke)
                     segment_pts = [stroke.points[idx]]
 
         if segment_pts:
             new_stroke = Stroke(stroke.color, stroke.thickness)
-            new_stroke.points = segment_pts
+            new_stroke.points = list(segment_pts)
             result.append(new_stroke)
 
     return result

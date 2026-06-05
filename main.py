@@ -6,7 +6,7 @@ from datetime import datetime
 import copy
 
 from core.stroke import Stroke, finalize_stroke
-from core.gestures import detect_gesture, find_stroke_at, apply_eraser, lm_px
+from core.gestures import (detect_gesture, find_stroke_at, apply_eraser, lm_px, get_wrist_angle, ROTATE_DEAD_ZONE)
 from core.ui import PALETTE, hit_palette, blend_canvas, render_canvas, draw_ui
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
@@ -51,15 +51,17 @@ def main():
     current_stroke = None
     undo_stack     = []
 
-    color_idx       = 0
-    eraser_mode     = False
-    fist_count      = 0
-    pinch_prev      = None
-    selected_stroke = None
-    smooth_buf      = deque(maxlen=SMOOTH_BUFFER)
+    color_idx        = 0
+    eraser_mode      = False
+    fist_count       = 0
+    pinch_prev       = None
+    selected_stroke  = None
+    smooth_buf       = deque(maxlen=SMOOTH_BUFFER)
+    prev_wrist_angle = None
+    is_rotating      = False
 
     with mp_hands.Hands(
-            max_num_hands=1,
+            max_num_hands=2,
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7) as hands:
 
@@ -71,18 +73,59 @@ def main():
             frame  = cv2.flip(frame, 1)
             result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-            lms     = None
-            gesture = "IDLE"
-
+            all_lms = []
             if result.multi_hand_landmarks:
-                hand_lms = result.multi_hand_landmarks[0]
-                mp_draw.draw_landmarks(frame, hand_lms, mp_hands.HAND_CONNECTIONS)
-                lms = hand_lms.landmark
+                for hand_obj in result.multi_hand_landmarks:
+                    mp_draw.draw_landmarks(frame, hand_obj, mp_hands.HAND_CONNECTIONS)
+                    all_lms.append(hand_obj.landmark)
 
-            if lms:
-                gesture, pinch_pt = detect_gesture(lms, w, h)
+            # ── Hand role assignment ──────────────────────────────────────────
+            # dominant = the drawing/pinching hand
+            # second   = only assigned when dominant is actively PINCHING
+            #
+            # When neither hand is pinching, pick dominant by gesture priority
+            # so a resting second hand never hijacks drawing.
+            dominant_lms = None
+            second_lms   = None
+            gesture      = "IDLE"
+            pinch_pt     = None
 
-                raw_ix, raw_iy = lm_px(lms[8], w, h)
+            if len(all_lms) == 1:
+                dominant_lms = all_lms[0]
+
+            elif len(all_lms) == 2:
+                g0, pt0 = detect_gesture(all_lms[0], w, h)
+                g1, pt1 = detect_gesture(all_lms[1], w, h)
+
+                if g0 == "PINCH":
+                    dominant_lms      = all_lms[0]
+                    second_lms        = all_lms[1]
+                    gesture, pinch_pt = g0, pt0
+
+                elif g1 == "PINCH":
+                    dominant_lms      = all_lms[1]
+                    second_lms        = all_lms[0]
+                    gesture, pinch_pt = g1, pt1
+
+                else:
+                    # Neither pinching — pick dominant by gesture priority.
+                    # Higher number = more intentional active gesture.
+                    # Second hand is intentionally left as None and ignored.
+                    priority = {"DRAW": 5, "ERASER": 4, "FIST": 3,
+                                "NEUTRAL": 2, "IDLE": 1}
+                    if priority.get(g0, 1) >= priority.get(g1, 1):
+                        dominant_lms      = all_lms[0]
+                        gesture, pinch_pt = g0, pt0
+                    else:
+                        dominant_lms      = all_lms[1]
+                        gesture, pinch_pt = g1, pt1
+
+            # ── Dominant hand processing ──────────────────────────────────────
+            if dominant_lms:
+                if gesture == "IDLE" and pinch_pt is None:
+                    gesture, pinch_pt = detect_gesture(dominant_lms, w, h)
+
+                raw_ix, raw_iy = lm_px(dominant_lms[8], w, h)
                 ix, iy         = smooth_point(smooth_buf, (raw_ix, raw_iy))
 
                 # Finalize in-progress stroke if gesture left draw/erase
@@ -93,12 +136,14 @@ def main():
                     else:
                         current_stroke = finalize_stroke(strokes, current_stroke)
 
-                # Deselect stroke if gesture left pinch
+                # Deselect stroke and reset rotation if leaving pinch
                 if gesture != "PINCH":
-                    selected_stroke = None
-                    pinch_prev      = None
+                    selected_stroke  = None
+                    pinch_prev       = None
+                    prev_wrist_angle = None
+                    is_rotating      = False
 
-                # ── FIST: hold to clear all strokes ──────────────────────
+                # ── FIST: hold to clear ───────────────────────────────────────
                 if gesture == "FIST":
                     fist_count += 1
                     if fist_count >= FIST_CLEAR_FRAMES:
@@ -107,7 +152,7 @@ def main():
                         fist_count = 0
                         print("[Cleared]")
 
-                # ── PINCH: find and move individual stroke ────────────────
+                # ── PINCH: move stroke + rotate via second hand wrist ─────────
                 elif gesture == "PINCH":
                     fist_count = 0
 
@@ -118,6 +163,7 @@ def main():
                             selected_stroke = candidate
                             pinch_prev      = pinch_pt
                     else:
+                        # Move with dominant hand
                         if pinch_prev is not None:
                             dx = pinch_pt[0] - pinch_prev[0]
                             dy = pinch_pt[1] - pinch_prev[1]
@@ -125,19 +171,37 @@ def main():
                                 selected_stroke.translate(dx, dy)
                         pinch_prev = pinch_pt
 
+                        # Rotate with second hand wrist twist
+                        if second_lms is not None:
+                            cur_angle = get_wrist_angle(second_lms, w, h)
+                            if prev_wrist_angle is not None:
+                                delta = cur_angle - prev_wrist_angle
+                                # Wrap delta into [-π, +π] to handle the ±π boundary
+                                if delta >  math.pi:
+                                    delta -= 2 * math.pi
+                                if delta < -math.pi:
+                                    delta += 2 * math.pi
+                                if abs(delta) > ROTATE_DEAD_ZONE:
+                                    selected_stroke.rotate(delta)
+                            prev_wrist_angle = cur_angle
+                            is_rotating      = True
+                        else:
+                            prev_wrist_angle = None
+                            is_rotating      = False
+
                     cv2.circle(frame, pinch_pt, 12, (255, 200, 0), 2)
 
-                # ── NEUTRAL: safe hover, nothing happens ──────────────────
+                # ── NEUTRAL ───────────────────────────────────────────────────
                 elif gesture == "NEUTRAL":
                     fist_count  = 0
                     eraser_mode = False
 
-                # ── ERASER: drag two fingers to erase like a duster ───────
+                # ── ERASER ────────────────────────────────────────────────────
                 elif gesture == "ERASER":
                     fist_count  = 0
                     eraser_mode = True
 
-                    mx, my = lm_px(lms[12], w, h)
+                    mx, my = lm_px(dominant_lms[12], w, h)
                     ex     = (ix + mx) // 2
                     ey     = (iy + my) // 2
 
@@ -152,7 +216,7 @@ def main():
                         if np.hypot(ex - last[0], ey - last[1]) > MIN_DRAW_DIST:
                             current_stroke.add_point((ex, ey))
 
-                # ── DRAW ──────────────────────────────────────────────────
+                # ── DRAW ──────────────────────────────────────────────────────
                 elif gesture == "DRAW":
                     fist_count  = 0
                     eraser_mode = False
@@ -177,31 +241,34 @@ def main():
                             elif dist >= MAX_DRAW_DIST:
                                 current_stroke.add_point((ix, iy))
 
-                # ── IDLE ──────────────────────────────────────────────────
+                # ── IDLE ──────────────────────────────────────────────────────
                 else:
                     fist_count = 0
 
             else:
-                # No hand in frame — finalize anything in progress
+                # No hands in frame
                 if current_stroke and current_stroke.is_eraser:
                     strokes        = apply_eraser(strokes, current_stroke)
                     current_stroke = None
                 else:
                     current_stroke = finalize_stroke(strokes, current_stroke)
 
-                fist_count      = 0
-                pinch_prev      = None
-                selected_stroke = None
+                fist_count       = 0
+                pinch_prev       = None
+                selected_stroke  = None
+                prev_wrist_angle = None
+                is_rotating      = False
                 smooth_buf.clear()
 
-            # ── Render ────────────────────────────────────────────────────
+            # ── Render ────────────────────────────────────────────────────────
             canvas = render_canvas(strokes, current_stroke, h, w)
             output = blend_canvas(frame, canvas)
             draw_ui(output, color_idx, eraser_mode,
-                    fist_count, FIST_CLEAR_FRAMES, gesture, selected_stroke)
+                    fist_count, FIST_CLEAR_FRAMES, gesture, selected_stroke,
+                    is_rotating=is_rotating)
             cv2.imshow("Air Doodle", output)
 
-            # ── Keyboard ──────────────────────────────────────────────────
+            # ── Keyboard ──────────────────────────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord('q'), 27):
@@ -209,9 +276,11 @@ def main():
 
             elif key == 26:                  # Ctrl+Z
                 if undo_stack:
-                    strokes         = undo_stack.pop()
-                    current_stroke  = None
-                    selected_stroke = None
+                    strokes          = undo_stack.pop()
+                    current_stroke   = None
+                    selected_stroke  = None
+                    prev_wrist_angle = None
+                    is_rotating      = False
                     print(f"[Undo] {len(undo_stack)} states left")
 
             elif key == 19:                  # Ctrl+S
@@ -228,6 +297,8 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
+
+import math
 
 if __name__ == "__main__":
     main()

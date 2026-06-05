@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import math
 
 # ─── Palette constants ─────────────────────────────────────────────────────────
 PALETTE = [
@@ -18,7 +19,6 @@ PAL_R    = 22
 
 
 def hit_palette(tip_x, tip_y):
-    """Returns palette index if finger is hovering a colour swatch, else -1."""
     if abs(tip_y - PAL_Y) > PAL_R + 8:
         return -1
     for i in range(len(PALETTE)):
@@ -28,10 +28,6 @@ def hit_palette(tip_x, tip_y):
 
 
 def blend_canvas(frame, canvas):
-    """
-    Non-black canvas pixels show as drawing.
-    Black (zero) canvas pixels are transparent — camera shows through.
-    """
     gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
     bg = cv2.bitwise_and(frame, frame, mask=cv2.bitwise_not(mask))
@@ -40,7 +36,6 @@ def blend_canvas(frame, canvas):
 
 
 def render_canvas(strokes, current_stroke, h, w):
-    """Re-render all strokes onto a fresh black canvas every frame."""
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
     for stroke in strokes:
         stroke.draw_on(canvas)
@@ -49,7 +44,8 @@ def render_canvas(strokes, current_stroke, h, w):
     return canvas
 
 
-def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames, gesture, selected_stroke):
+def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames,
+            gesture, selected_stroke, is_rotating=False):
     h, w = frame.shape[:2]
 
     # ── Colour palette ────────────────────────────────────────────────────────
@@ -71,20 +67,26 @@ def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames, gestur
     }
     lbl_key   = "ERASER" if eraser_mode else gesture
     text, col = labels.get(lbl_key, ("", (255, 255, 255)))
-    cv2.putText(frame, text, (w - 270, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
+    if is_rotating:
+        text = text + "  [ ROTATING ]"
+        col  = (255, 165, 0)
+    cv2.putText(frame, text, (w - 370, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2)
 
-    # ── Selected stroke highlight ─────────────────────────────────────────────
+    # ── Selected stroke bounding box ──────────────────────────────────────────
     if selected_stroke:
         b = selected_stroke.bounds()
         if b:
             x1, y1, x2, y2 = b
-            pad = 12
+            pad       = 12
+            box_color = (255, 165, 0) if is_rotating else (0, 220, 255)
+            angle_deg = int(math.degrees(selected_stroke._angle) % 360)
+            box_label = f"rotating {angle_deg}°" if is_rotating else "moving"
             cv2.rectangle(frame,
                           (x1 - pad, y1 - pad),
                           (x2 + pad, y2 + pad),
-                          (0, 220, 255), 2)
-            cv2.putText(frame, "moving", (x1 - pad, y1 - pad - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
+                          box_color, 2)
+            cv2.putText(frame, box_label, (x1 - pad, y1 - pad - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1)
 
     # ── Fist clear progress bar ───────────────────────────────────────────────
     if fist_count > 0:
@@ -102,10 +104,12 @@ def draw_ui(frame, color_idx, eraser_mode, fist_count, fist_clear_frames, gestur
         "2 close   : erase",
         "2 spread  : hover",
         "pinch     : move stroke",
+        "pinch +   : bring 2nd hand",
+        "  twist wrist = rotate",
         "fist 1sec : clear all",
     ]
     for j, line in enumerate(guide):
-        cv2.putText(frame, line, (w - 185, 65 + j * 20),
+        cv2.putText(frame, line, (w - 215, h - 185 + j * 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.37, (140, 140, 140), 1)
 
     # ── Controls hint ─────────────────────────────────────────────────────────
