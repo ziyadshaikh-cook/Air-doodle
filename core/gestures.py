@@ -100,7 +100,7 @@ def apply_eraser(strokes, eraser_stroke):
     if not eraser_stroke.points:
         return strokes
 
-    radius = eraser_stroke.thickness // 2
+    eraser_radius = eraser_stroke.thickness // 2
     result = []
 
     for stroke in strokes:
@@ -108,10 +108,12 @@ def apply_eraser(strokes, eraser_stroke):
             continue
 
         # Build a boolean mask: True = point survives
+        # Correct erase reach: eraser circle must overlap stroke point's visual circle
+        erase_reach = eraser_radius + stroke.thickness // 2
         surviving_mask = []
         for sp in stroke.points:
             hit = any(
-                np.hypot(ep[0] - sp[0], ep[1] - sp[1]) < radius
+                np.hypot(ep[0] - sp[0], ep[1] - sp[1]) < erase_reach
                 for ep in eraser_stroke.points
             )
             surviving_mask.append(not hit)
